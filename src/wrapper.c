@@ -26,6 +26,9 @@ static OSStatus AUSetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
 static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData);
 static OSStatus AUReset(void *self, AudioUnitScope scope, AudioUnitElement elem);
 
+static OSStatus AUGetParameter(void *self, AudioUnitParameterID param, AudioUnitScope scope, AudioUnitElement elem, AudioUnitParameterValue *value);
+static OSStatus AUSetParameter(void *self, AudioUnitParameterID param, AudioUnitScope scope, AudioUnitElement elem, AudioUnitParameterValue value, UInt32 bufferOffset);
+
 static AudioUnitPropertyListenerProc myListenerProc = NULL;
 static void *myListenerUserData = NULL;
 
@@ -59,6 +62,8 @@ static AudioComponentMethod AULookup(SInt16 selector) {
         case kAudioUnitAddPropertyListenerSelect: return (AudioComponentMethod)AUAddPropertyListener;
         case kAudioUnitRemovePropertyListenerSelect: return (AudioComponentMethod)AURemovePropertyListener;
         case 18: return (AudioComponentMethod)AURemovePropertyListenerWithUserData;
+        case kAudioUnitGetParameterSelect: return (AudioComponentMethod)AUGetParameter;
+        case kAudioUnitSetParameterSelect: return (AudioComponentMethod)AUSetParameter;
         default: return NULL;
     }
 }
@@ -105,6 +110,24 @@ static OSStatus AUInitialize(void *self) { return noErr; }
 static OSStatus AUUninitialize(void *self) { return noErr; }
 static OSStatus AUReset(void *self, AudioUnitScope scope, AudioUnitElement elem) { return noErr; }
 
+static OSStatus AUGetParameter(void *self, AudioUnitParameterID param, AudioUnitScope scope, AudioUnitElement elem, AudioUnitParameterValue *value) {
+    MyPluginState *state = (MyPluginState *)self;
+    if (param == 0) {
+        *value = state->volume;
+        return noErr;
+    }
+    return kAudioUnitErr_InvalidParameter;
+}
+
+static OSStatus AUSetParameter(void *self, AudioUnitParameterID param, AudioUnitScope scope, AudioUnitElement elem, AudioUnitParameterValue value, UInt32 bufferOffset) {
+    MyPluginState *state = (MyPluginState *)self;
+    if (param == 0) {
+        state->volume = value;
+        return noErr;
+    }
+    return kAudioUnitErr_InvalidParameter;
+}
+
 static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUnitScope scope, AudioUnitElement elem, UInt32 *outDataSize, Boolean *outWritable) {
     switch (prop) {
         case kAudioUnitProperty_StreamFormat:
@@ -135,6 +158,17 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
             if (outDataSize) *outDataSize = sizeof(Float64);
             if (outWritable) *outWritable = true;
             return noErr;
+        case kAudioUnitProperty_ParameterList:
+            if (outDataSize) *outDataSize = sizeof(AudioUnitParameterID) * 1;
+            if (outWritable) *outWritable = false;
+            return noErr;
+        case kAudioUnitProperty_ParameterInfo:
+            if (elem == 0) {
+                if (outDataSize) *outDataSize = sizeof(AudioUnitParameterInfo);
+                if (outWritable) *outWritable = false;
+                return noErr;
+            }
+            return kAudioUnitErr_InvalidProperty;
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -189,6 +223,25 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
         case kAudioUnitProperty_SampleRate:
             *(Float64 *)outData = state->streamFormat.mSampleRate;
             return noErr;
+        case kAudioUnitProperty_ParameterList:
+            if (outDataSize && *outDataSize >= sizeof(AudioUnitParameterID)) {
+                ((AudioUnitParameterID*)outData)[0] = 0;
+            }
+            return noErr;
+        case kAudioUnitProperty_ParameterInfo:
+            if (elem == 0) {
+                AudioUnitParameterInfo *info = (AudioUnitParameterInfo *)outData;
+                memset(info, 0, sizeof(AudioUnitParameterInfo));
+                strcpy(info->name, "Volume");
+                info->cfNameString = CFSTR("Volume");
+                info->unit = kAudioUnitParameterUnit_LinearGain;
+                info->minValue = 0.0f;
+                info->maxValue = 1.0f;
+                info->defaultValue = 0.5f;
+                info->flags = kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_HasCFNameString;
+                return noErr;
+            }
+            return kAudioUnitErr_InvalidProperty;
     }
     return kAudioUnitErr_InvalidProperty;
 }
