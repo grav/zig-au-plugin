@@ -4,33 +4,49 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const root_module = b.createModule(.{
+    // 1. Build the Zig DSP logic as a separate dynamic library (libdsp.dylib)
+    const dsp_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const dsp_lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "dsp",
+        .root_module = dsp_module,
+    });
 
-    root_module.addCSourceFile(.{
+    // Install the DSP library into the .component bundle's MacOS folder alongside the wrapper
+    const install_dsp = b.addInstallArtifact(dsp_lib, .{
+        .dest_dir = .{ .override = .{ .custom = "MyZigPlugin.component/Contents/MacOS" } },
+    });
+    b.getInstallStep().dependOn(&install_dsp.step);
+
+    // 2. Build the C wrapper as the main plugin binary (libMyZigPlugin.dylib)
+    const wrapper_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    wrapper_module.addCSourceFile(.{
         .file = b.path("src/wrapper.c"),
         .flags = &.{"-fblocks"},
     });
-    root_module.linkSystemLibrary("c", .{});
-    root_module.linkFramework("AudioToolbox", .{});
-    root_module.linkFramework("CoreFoundation", .{});
+    wrapper_module.linkSystemLibrary("c", .{});
+    wrapper_module.linkFramework("AudioToolbox", .{});
+    wrapper_module.linkFramework("CoreFoundation", .{});
+    wrapper_module.linkFramework("Cocoa", .{});
 
-    const lib = b.addLibrary(.{
+    const wrapper_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "MyZigPlugin",
-        .root_module = root_module,
+        .root_module = wrapper_module,
     });
 
-    b.installArtifact(lib);
-
-    // Create the .component bundle
-    const install_bin = b.addInstallArtifact(lib, .{
+    // Install the wrapper into the .component bundle
+    const install_wrapper = b.addInstallArtifact(wrapper_lib, .{
         .dest_dir = .{ .override = .{ .custom = "MyZigPlugin.component/Contents/MacOS" } },
     });
-    b.getInstallStep().dependOn(&install_bin.step);
+    b.getInstallStep().dependOn(&install_wrapper.step);
 
     const info_plist =
         \\<?xml version="1.0" encoding="UTF-8"?>

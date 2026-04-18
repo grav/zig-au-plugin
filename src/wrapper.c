@@ -2,8 +2,68 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
+#include <stdatomic.h>
 
-extern void processAudio(const float* in_buffer, float* out_buffer, size_t frames, float volume);
+#ifdef __OBJC__
+#import <Cocoa/Cocoa.h>
+#import <AudioUnit/AUCocoaUIView.h>
+
+static void reloadDSP(void);
+
+@interface MyPluginUI : NSObject <AUCocoaUIBase>
+@end
+
+@implementation MyPluginUI
+
+- (unsigned)interfaceVersion {
+    return 0;
+}
+
+- (NSView *)uiViewForAudioUnit:(AudioUnit)inAudioUnit withSize:(NSSize)inPreferredSize {
+    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 100)];
+    NSButton *button = [NSButton buttonWithTitle:@"Reload Zig DSP" target:self action:@selector(reloadClicked:)];
+    button.frame = NSMakeRect(50, 30, 200, 40);
+    [view addSubview:button];
+    return view;
+}
+
+- (void)reloadClicked:(id)sender {
+    // Attempt to invoke zig build locally (optional but cool for live coding)
+    system("cd /Users/grav/repo/zig-plugin && ~/bin/zig-aarch64-macos-0.16.0/zig build");
+    reloadDSP();
+}
+
+@end
+#endif
+
+typedef void (*ProcessAudioFunc)(const float*, float*, size_t, float);
+
+static void defaultProcessAudio(const float* in_buffer, float* out_buffer, size_t frames, float volume) {
+    for (size_t i = 0; i < frames; i++) {
+        out_buffer[i] = in_buffer[i] * volume;
+    }
+}
+
+static _Atomic ProcessAudioFunc g_processAudio = defaultProcessAudio;
+static void* g_dspHandle = NULL;
+
+static void reloadDSP(void) {
+    const char* dylibPath = "/Users/grav/repo/zig-plugin/zig-out/MyZigPlugin.component/Contents/MacOS/libdsp.dylib";
+    
+    void* newHandle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL);
+    if (newHandle) {
+        ProcessAudioFunc newFunc = (ProcessAudioFunc)dlsym(newHandle, "processAudio");
+        if (newFunc) {
+            atomic_store(&g_processAudio, newFunc);
+            // Optionally close the old handle, but it might crash the audio thread if it's currently executing.
+            // In a simple hot reload scenario, leaking handles is safer until a proper RCU is implemented.
+            g_dspHandle = newHandle; 
+        } else {
+            dlclose(newHandle);
+        }
+    }
+}
 
 typedef struct {
     AudioComponentPlugInInterface pluginInterface;
@@ -11,6 +71,7 @@ typedef struct {
     float volume;
     AudioStreamBasicDescription streamFormat;
     AURenderCallbackStruct renderCallback;
+    AURenderCallbackStruct notifyCallback;
     AudioUnitConnection connection;
     UInt32 maxFrames;
     AUPreset currentPreset;
@@ -50,7 +111,28 @@ static OSStatus AURemovePropertyListenerWithUserData(void *self, AudioUnitProper
     return noErr; 
 }
 
+static OSStatus AUAddRenderNotify(void *self, AURenderCallback proc, void *userData) {
+    MyPluginState *state = (MyPluginState *)self;
+    state->notifyCallback.inputProc = proc;
+    state->notifyCallback.inputProcRefCon = userData;
+    return noErr;
+}
+static OSStatus AURemoveRenderNotify(void *self, AURenderCallback proc, void *userData) {
+    MyPluginState *state = (MyPluginState *)self;
+    if (state->notifyCallback.inputProc == proc && state->notifyCallback.inputProcRefCon == userData) {
+        state->notifyCallback.inputProc = NULL;
+        state->notifyCallback.inputProcRefCon = NULL;
+    }
+    return noErr;
+}
+
+static OSStatus AUScheduleParameters(void *self, const AudioUnitParameterEvent *inParameterEvent, UInt32 inNumParamEvents) {
+    fprintf(stderr, "CALLED SCHEDULE PARAMETERS\n");
+    return noErr;
+}
+
 static AudioComponentMethod AULookup(SInt16 selector) {
+    fprintf(stderr, "LOOKUP: %d\n", selector);
     switch (selector) {
         case kAudioUnitInitializeSelect: return (AudioComponentMethod)AUInitialize;
         case kAudioUnitUninitializeSelect: return (AudioComponentMethod)AUUninitialize;
@@ -64,7 +146,16 @@ static AudioComponentMethod AULookup(SInt16 selector) {
         case 18: return (AudioComponentMethod)AURemovePropertyListenerWithUserData;
         case kAudioUnitGetParameterSelect: return (AudioComponentMethod)AUGetParameter;
         case kAudioUnitSetParameterSelect: return (AudioComponentMethod)AUSetParameter;
-        default: return NULL;
+        case kAudioUnitScheduleParametersSelect: return (AudioComponentMethod)AUScheduleParameters;
+        case 15: 
+            fprintf(stderr, "LOOKUP 15\n");
+            return (AudioComponentMethod)AUAddRenderNotify;
+        case 16: 
+            fprintf(stderr, "LOOKUP 16\n");
+            return (AudioComponentMethod)AURemoveRenderNotify;
+        default: 
+            printf("Lookup requested unhandled selector: %d\n", selector);
+            return NULL;
     }
 }
 
@@ -106,7 +197,11 @@ static OSStatus AUClose(void *self) {
     return noErr;
 }
 
-static OSStatus AUInitialize(void *self) { return noErr; }
+static OSStatus AUInitialize(void *self) {
+    printf("AUInitialize called\n");
+    reloadDSP();
+    return noErr;
+}
 static OSStatus AUUninitialize(void *self) { return noErr; }
 static OSStatus AUReset(void *self, AudioUnitScope scope, AudioUnitElement elem) { return noErr; }
 
@@ -169,6 +264,12 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
                 return noErr;
             }
             return kAudioUnitErr_InvalidProperty;
+//#ifdef __OBJC__
+//        case kAudioUnitProperty_CocoaUI:
+//            if (outDataSize) *outDataSize = sizeof(AudioUnitCocoaViewInfo);
+//            if (outWritable) *outWritable = true;
+//            return noErr;
+//#endif
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -229,7 +330,7 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
             }
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
-            if (elem == 0) {
+            if (elem == 0 && scope == kAudioUnitScope_Global) {
                 AudioUnitParameterInfo *info = (AudioUnitParameterInfo *)outData;
                 memset(info, 0, sizeof(AudioUnitParameterInfo));
                 strcpy(info->name, "Volume");
@@ -242,6 +343,14 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
                 return noErr;
             }
             return kAudioUnitErr_InvalidProperty;
+//#ifdef __OBJC__
+//        case kAudioUnitProperty_CocoaUI: {
+//            AudioUnitCocoaViewInfo *info = (AudioUnitCocoaViewInfo *)outData;
+//            info->mCocoaAUViewBundleLocation = NULL; // loaded from same bundle
+//            info->mCocoaAUViewClass[0] = CFSTR("MyPluginUI");
+//            return noErr;
+//        }
+//#endif
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -294,6 +403,10 @@ static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, 
         }
     }
 
+    if (state->notifyCallback.inputProc) {
+        state->notifyCallback.inputProc(state->notifyCallback.inputProcRefCon, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
+    }
+    
     if (state->connection.sourceAudioUnit) {
         OSStatus err = AudioUnitRender(state->connection.sourceAudioUnit, ioActionFlags, inTimeStamp, state->connection.sourceOutputNumber, inNumberFrames, ioData);
         if (err != noErr) return err;
@@ -306,7 +419,8 @@ static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, 
     for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
         float *buffer = (float *)ioData->mBuffers[i].mData;
         if (buffer) {
-            processAudio(buffer, buffer, inNumberFrames, state->volume);
+            ProcessAudioFunc func = atomic_load(&g_processAudio);
+            func(buffer, buffer, inNumberFrames, state->volume);
         }
     }
     return noErr;
