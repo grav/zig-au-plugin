@@ -1,0 +1,51 @@
+name: Build and Test AU Plugin
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.16.0
+    
+    - name: Build plugin
+      run: zig build
+    
+    - name: Check build output
+      run: |
+        ls -la zig-out/
+        ls -la zig-out/MyZigPlugin.component/Contents/
+        file zig-out/MyZigPlugin.component/Contents/MacOS/libMyZigPlugin.dylib
+    
+    - name: Install plugin
+      run: |
+        mkdir -p ~/Library/Audio/Plug-Ins/Components
+        cp -r zig-out/MyZigPlugin.component ~/Library/Audio/Plug-Ins/Components
+    
+    - name: Clear AU cache
+      run: killall -9 AudioComponentRegistrar 2>/dev/null || true
+    
+    - name: Wait for system to settle
+      run: sleep 2
+    
+    - name: Run auval
+      run: auval -v aufx volu Zigg
+      timeout-minutes: 5
+    
+    - name: Upload plugin artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: MyZigPlugin.component
+        path: zig-out/MyZigPlugin.component/
