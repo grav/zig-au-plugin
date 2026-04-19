@@ -5,6 +5,8 @@
 
 extern void processAudio(const float* in_buffer, float* out_buffer, size_t frames, float volume);
 
+#define MAX_RENDER_NOTIFY_CALLBACKS 8
+
 typedef struct {
     AudioComponentPlugInInterface pluginInterface;
     AudioComponentInstance instance;
@@ -14,6 +16,8 @@ typedef struct {
     AudioUnitConnection connection;
     UInt32 maxFrames;
     AUPreset currentPreset;
+    AURenderCallbackStruct renderNotifyCallbacks[MAX_RENDER_NOTIFY_CALLBACKS];
+    UInt32 renderNotifyCount;
 } MyPluginState;
 
 static OSStatus AUOpen(void *self, AudioComponentInstance compInstance);
@@ -50,6 +54,50 @@ static OSStatus AURemovePropertyListenerWithUserData(void *self, AudioUnitProper
     return noErr; 
 }
 
+static OSStatus AUAddRenderNotify(void *self, AURenderCallback proc, void *userData) {
+    MyPluginState *state = (MyPluginState *)self;
+    if (state->renderNotifyCount >= MAX_RENDER_NOTIFY_CALLBACKS) {
+        return kAudioUnitErr_TooManyFramesToProcess; // No room for more callbacks
+    }
+    state->renderNotifyCallbacks[state->renderNotifyCount].inputProc = proc;
+    state->renderNotifyCallbacks[state->renderNotifyCount].inputProcRefCon = userData;
+    state->renderNotifyCount++;
+    return noErr;
+}
+
+static OSStatus AURemoveRenderNotify(void *self, AURenderCallback proc, void *userData) {
+    MyPluginState *state = (MyPluginState *)self;
+    for (UInt32 i = 0; i < state->renderNotifyCount; i++) {
+        if (state->renderNotifyCallbacks[i].inputProc == proc && 
+            state->renderNotifyCallbacks[i].inputProcRefCon == userData) {
+            // Shift remaining callbacks down
+            for (UInt32 j = i; j < state->renderNotifyCount - 1; j++) {
+                state->renderNotifyCallbacks[j] = state->renderNotifyCallbacks[j + 1];
+            }
+            state->renderNotifyCount--;
+            return noErr;
+        }
+    }
+    return noErr;
+}
+
+static OSStatus AUScheduleParameters(void *self, const AudioUnitParameterEvent *inParameterEvents, UInt32 inNumEvents) {
+    // For a simple plugin, we can just apply the parameter changes immediately
+    for (UInt32 i = 0; i < inNumEvents; i++) {
+        const AudioUnitParameterEvent *event = &inParameterEvents[i];
+        if (event->eventType == kParameterEvent_Immediate) {
+            AUSetParameter(self, event->parameter, event->scope, event->element, 
+                          event->eventValues.immediate.value, event->eventValues.immediate.bufferOffset);
+        } else if (event->eventType == kParameterEvent_Ramped) {
+            // For ramped events, just set to the end value immediately
+            // A more sophisticated plugin would interpolate
+            AUSetParameter(self, event->parameter, event->scope, event->element,
+                          event->eventValues.ramp.endValue, 0);
+        }
+    }
+    return noErr;
+}
+
 static AudioComponentMethod AULookup(SInt16 selector) {
     switch (selector) {
         case kAudioUnitInitializeSelect: return (AudioComponentMethod)AUInitialize;
@@ -64,6 +112,9 @@ static AudioComponentMethod AULookup(SInt16 selector) {
         case 18: return (AudioComponentMethod)AURemovePropertyListenerWithUserData;
         case kAudioUnitGetParameterSelect: return (AudioComponentMethod)AUGetParameter;
         case kAudioUnitSetParameterSelect: return (AudioComponentMethod)AUSetParameter;
+        case kAudioUnitScheduleParametersSelect: return (AudioComponentMethod)AUScheduleParameters;
+        case kAudioUnitAddRenderNotifySelect: return (AudioComponentMethod)AUAddRenderNotify;
+        case kAudioUnitRemoveRenderNotifySelect: return (AudioComponentMethod)AURemoveRenderNotify;
         default: return NULL;
     }
 }
@@ -112,6 +163,15 @@ static OSStatus AUReset(void *self, AudioUnitScope scope, AudioUnitElement elem)
 
 static OSStatus AUGetParameter(void *self, AudioUnitParameterID param, AudioUnitScope scope, AudioUnitElement elem, AudioUnitParameterValue *value) {
     MyPluginState *state = (MyPluginState *)self;
+    
+    // Only support Global scope, element 0
+    if (scope != kAudioUnitScope_Global) {
+        return kAudioUnitErr_InvalidScope;
+    }
+    if (elem != 0) {
+        return kAudioUnitErr_InvalidElement;
+    }
+    
     if (param == 0) {
         *value = state->volume;
         return noErr;
@@ -121,6 +181,15 @@ static OSStatus AUGetParameter(void *self, AudioUnitParameterID param, AudioUnit
 
 static OSStatus AUSetParameter(void *self, AudioUnitParameterID param, AudioUnitScope scope, AudioUnitElement elem, AudioUnitParameterValue value, UInt32 bufferOffset) {
     MyPluginState *state = (MyPluginState *)self;
+    
+    // Only support Global scope, element 0
+    if (scope != kAudioUnitScope_Global) {
+        return kAudioUnitErr_InvalidScope;
+    }
+    if (elem != 0) {
+        return kAudioUnitErr_InvalidElement;
+    }
+    
     if (param == 0) {
         state->volume = value;
         return noErr;
@@ -159,16 +228,24 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
             if (outWritable) *outWritable = true;
             return noErr;
         case kAudioUnitProperty_ParameterList:
+            // Only support Global scope
+            if (scope != kAudioUnitScope_Global) {
+                return kAudioUnitErr_InvalidScope;
+            }
             if (outDataSize) *outDataSize = sizeof(AudioUnitParameterID) * 1;
             if (outWritable) *outWritable = false;
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
+            // Only support Global scope, element 0
+            if (scope != kAudioUnitScope_Global) {
+                return kAudioUnitErr_InvalidScope;
+            }
             if (elem == 0) {
                 if (outDataSize) *outDataSize = sizeof(AudioUnitParameterInfo);
                 if (outWritable) *outWritable = false;
                 return noErr;
             }
-            return kAudioUnitErr_InvalidProperty;
+            return kAudioUnitErr_InvalidParameter;
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -224,11 +301,19 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
             *(Float64 *)outData = state->streamFormat.mSampleRate;
             return noErr;
         case kAudioUnitProperty_ParameterList:
+            // Only support Global scope
+            if (scope != kAudioUnitScope_Global) {
+                return kAudioUnitErr_InvalidScope;
+            }
             if (outDataSize && *outDataSize >= sizeof(AudioUnitParameterID)) {
                 ((AudioUnitParameterID*)outData)[0] = 0;
             }
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
+            // Only support Global scope, element 0
+            if (scope != kAudioUnitScope_Global) {
+                return kAudioUnitErr_InvalidScope;
+            }
             if (elem == 0) {
                 AudioUnitParameterInfo *info = (AudioUnitParameterInfo *)outData;
                 memset(info, 0, sizeof(AudioUnitParameterInfo));
@@ -241,7 +326,7 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
                 info->flags = kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_HasCFNameString;
                 return noErr;
             }
-            return kAudioUnitErr_InvalidProperty;
+            return kAudioUnitErr_InvalidParameter;
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -288,6 +373,21 @@ static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, 
     MyPluginState *state = (MyPluginState *)self;
     if (inNumberFrames > 100000) return kAudioUnitErr_TooManyFramesToProcess;
 
+    // Call pre-render notify callbacks
+    for (UInt32 i = 0; i < state->renderNotifyCount; i++) {
+        AudioUnitRenderActionFlags preFlags = kAudioUnitRenderAction_PreRender;
+        if (state->renderNotifyCallbacks[i].inputProc) {
+            state->renderNotifyCallbacks[i].inputProc(
+                state->renderNotifyCallbacks[i].inputProcRefCon,
+                &preFlags,
+                inTimeStamp,
+                inOutputBusNumber,
+                inNumberFrames,
+                ioData
+            );
+        }
+    }
+
     for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
         if (!ioData->mBuffers[i].mData && i < 8) {
             ioData->mBuffers[i].mData = dummyBuffer[i];
@@ -309,5 +409,21 @@ static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, 
             processAudio(buffer, buffer, inNumberFrames, state->volume);
         }
     }
+
+    // Call post-render notify callbacks
+    for (UInt32 i = 0; i < state->renderNotifyCount; i++) {
+        AudioUnitRenderActionFlags postFlags = kAudioUnitRenderAction_PostRender;
+        if (state->renderNotifyCallbacks[i].inputProc) {
+            state->renderNotifyCallbacks[i].inputProc(
+                state->renderNotifyCallbacks[i].inputProcRefCon,
+                &postFlags,
+                inTimeStamp,
+                inOutputBusNumber,
+                inNumberFrames,
+                ioData
+            );
+        }
+    }
+
     return noErr;
 }
