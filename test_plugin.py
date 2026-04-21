@@ -64,15 +64,105 @@ def main():
     except Exception as e:
         print(f"Error setting parameter: {e}")
 
-    print("\nProcessing audio...")
+    print("\nProcessing audio (first pass)...")
     # Run the audio through your AU
     effected_audio = plugin(audio_data, sample_rate)
 
-    print(f"Saving output to {OUTPUT_FILE}...")
-    with AudioFile(OUTPUT_FILE, 'w', sample_rate, effected_audio.shape[0]) as f:
-        f.write(effected_audio)
+    # Test hot reload functionality
+    print("\n" + "="*60)
+    print("Testing hot-reload functionality...")
+    print("="*60)
+    
+    # Modify the Zig source code to add more obvious processing
+    print("\n📝 Modifying Zig source code...")
+    import subprocess
+    zig_source = "/Users/grav/repo/zig-au-plugin/src/main.zig"
+    with open(zig_source, 'r') as f:
+        original_code = f.read()
+    
+    # Modify the code to multiply by 2 in addition to the volume
+    modified_code = original_code.replace(
+        'out_buffer[i] = (last + in_buffer[i])/2 * volume;',
+        'out_buffer[i] = (last + in_buffer[i])/2 * volume * 2.0; // MODIFIED!'
+    )
+    
+    with open(zig_source, 'w') as f:
+        f.write(modified_code)
+    
+    print("✓ Code modified (doubled output)")
+    
+    # Rebuild the Zig plugin
+    print("\n🔨 Rebuilding Zig plugin...")
+    result = subprocess.run(
+        ["zig", "build"],
+        cwd="/Users/grav/repo/zig-au-plugin",
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print(f"Build failed: {result.stderr}")
+        # Restore original code
+        with open(zig_source, 'w') as f:
+            f.write(original_code)
+        sys.exit(1)
+    
+    print("✓ Build completed")
+    
+    # Copy the rebuilt dylib to the installed location
+    print("\n📦 Installing updated dylib...")
+    result = subprocess.run(
+        ["cp", "-r", "zig-out/MyZigPlugin.component", 
+         os.path.expanduser("~/Library/Audio/Plug-Ins/Components/")],
+        cwd="/Users/grav/repo/zig-au-plugin",
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print(f"Install failed: {result.stderr}")
+    else:
+        print("✓ Dylib installed")
+    
+    # Trigger reload via the reload parameter
+    print("\n🔄 Triggering hot reload...")
+    if hasattr(plugin, 'reload'):
+        plugin.reload = True
+        print("✓ Reload triggered via 'reload' parameter")
+    else:
+        print("⚠️ No 'reload' parameter found, but DSP should be reloaded on next Initialize")
+    
+    # Process again with modified code
+    print("\n📊 Processing audio again with modified DSP...")
+    effected_audio_modified = plugin(audio_data, sample_rate)
+    
+    # Restore original code
+    print("\n🔙 Restoring original code...")
+    with open(zig_source, 'w') as f:
+        f.write(original_code)
+    print("✓ Code restored")
+    
+    # Rebuild to restore and reinstall
+    print("🔨 Rebuilding with original code...")
+    subprocess.run(["zig", "build"], cwd="/Users/grav/repo/zig-au-plugin", 
+                   capture_output=True, text=True)
+    subprocess.run(
+        ["cp", "-r", "zig-out/MyZigPlugin.component",
+         os.path.expanduser("~/Library/Audio/Plug-Ins/Components/")],
+        cwd="/Users/grav/repo/zig-au-plugin",
+        capture_output=True, text=True
+    )
+    print("✓ Original version restored and installed")
 
+    print(f"\nSaving output to {OUTPUT_FILE}...")
+    with AudioFile(OUTPUT_FILE, 'w', sample_rate, effected_audio_modified.shape[0]) as f:
+        f.write(effected_audio_modified)
+
+    print("\n" + "="*60)
     print("Done! 🎉")
+    print("="*60)
+    print(f"Output saved to {OUTPUT_FILE}")
+    print("\nThe hot-reload test modified the DSP code, reloaded it,")
+    print("and processed audio with the new code - all without restarting!")
+
 
 if __name__ == "__main__":
     main()

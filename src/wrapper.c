@@ -29,8 +29,7 @@ static void reloadDSP(void);
 }
 
 - (void)reloadClicked:(id)sender {
-    // Attempt to invoke zig build locally (optional but cool for live coding)
-    system("cd /Users/grav/repo/zig-plugin && ~/bin/zig-aarch64-macos-0.16.0/zig build");
+    fprintf(stderr, "Reload button clicked!\n");
     reloadDSP();
 }
 
@@ -49,20 +48,54 @@ static _Atomic ProcessAudioFunc g_processAudio = defaultProcessAudio;
 static void* g_dspHandle = NULL;
 
 static void reloadDSP(void) {
-    const char* dylibPath = "/Users/grav/repo/zig-plugin/zig-out/MyZigPlugin.component/Contents/MacOS/libdsp.dylib";
+    char dylibPath[1024];
     
-    void* newHandle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL);
-    if (newHandle) {
-        ProcessAudioFunc newFunc = (ProcessAudioFunc)dlsym(newHandle, "processAudio");
-        if (newFunc) {
-            atomic_store(&g_processAudio, newFunc);
-            // Optionally close the old handle, but it might crash the audio thread if it's currently executing.
-            // In a simple hot reload scenario, leaking handles is safer until a proper RCU is implemented.
-            g_dspHandle = newHandle; 
-        } else {
-            dlclose(newHandle);
-        }
+    // Use dladdr to find where our own code is loaded from
+    Dl_info info;
+    if (dladdr((void*)reloadDSP, &info) == 0 || info.dli_fname == NULL) {
+        fprintf(stderr, "reloadDSP: ⚠️ Failed to determine plugin location\n");
+        return;
     }
+    
+    // The dli_fname will be something like:
+    // /Users/.../MyZigPlugin.component/Contents/MacOS/libMyZigPlugin.dylib
+    // We need to change libMyZigPlugin.dylib to libdsp.dylib
+    
+    char* lastSlash = strrchr(info.dli_fname, '/');
+    if (lastSlash == NULL) {
+        fprintf(stderr, "reloadDSP: ⚠️ Invalid plugin path\n");
+        return;
+    }
+    
+    size_t dirLen = lastSlash - info.dli_fname + 1;
+    if (dirLen >= sizeof(dylibPath) - 20) {
+        fprintf(stderr, "reloadDSP: ⚠️ Path too long\n");
+        return;
+    }
+    
+    strncpy(dylibPath, info.dli_fname, dirLen);
+    dylibPath[dirLen] = '\0';
+    strcat(dylibPath, "libdsp.dylib");
+    
+    fprintf(stderr, "reloadDSP: Loading from bundle: %s\n", dylibPath);
+    
+    void* handle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL);
+    if (handle) {
+        ProcessAudioFunc newFunc = (ProcessAudioFunc)dlsym(handle, "processAudio");
+        if (newFunc) {
+            fprintf(stderr, "reloadDSP: ✓ Loaded successfully\n");
+            atomic_store(&g_processAudio, newFunc);
+            g_dspHandle = handle;
+            return;
+        } else {
+            fprintf(stderr, "reloadDSP: ✗ Failed to find processAudio symbol: %s\n", dlerror());
+        }
+        dlclose(handle);
+    } else {
+        fprintf(stderr, "reloadDSP: ✗ Failed to load dylib: %s\n", dlerror());
+    }
+    
+    fprintf(stderr, "reloadDSP: ⚠️ Using default C implementation\n");
 }
 
 #define MAX_RENDER_NOTIFY_CALLBACKS 8
@@ -71,6 +104,7 @@ typedef struct {
     AudioComponentPlugInInterface pluginInterface;
     AudioComponentInstance instance;
     float volume;
+    float reloadTrigger;
     AudioStreamBasicDescription streamFormat;
     AURenderCallbackStruct renderCallback;
     AURenderCallbackStruct notifyCallback;
@@ -203,6 +237,7 @@ void* MyZigPluginFactory(const AudioComponentDescription *inDesc) {
     
     state->maxFrames = 512;
     state->volume = 0.5f;
+    state->reloadTrigger = 0.0f;
     state->currentPreset.presetNumber = 0;
     state->currentPreset.presetName = CFSTR("Default");
 
@@ -242,6 +277,10 @@ static OSStatus AUGetParameter(void *self, AudioUnitParameterID param, AudioUnit
         *value = state->volume;
         return noErr;
     }
+    if (param == 1) {
+        *value = state->reloadTrigger;
+        return noErr;
+    }
     return kAudioUnitErr_InvalidParameter;
 }
 
@@ -258,6 +297,14 @@ static OSStatus AUSetParameter(void *self, AudioUnitParameterID param, AudioUnit
     
     if (param == 0) {
         state->volume = value;
+        return noErr;
+    }
+    if (param == 1) {
+        if (value >= 0.5f) {  // Trigger reload when set to 1.0 (or >= 0.5)
+            fprintf(stderr, "🔄 Reload triggered via parameter!\n");
+            reloadDSP();
+        }
+        state->reloadTrigger = value;
         return noErr;
     }
     return kAudioUnitErr_InvalidParameter;
@@ -298,7 +345,7 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
-            if (outDataSize) *outDataSize = sizeof(AudioUnitParameterID) * 1;
+            if (outDataSize) *outDataSize = sizeof(AudioUnitParameterID) * 2;  // 2 parameters
             if (outWritable) *outWritable = false;
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
@@ -306,7 +353,7 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
-            if (elem == 0) {
+            if (elem == 0 || elem == 1) {
                 if (outDataSize) *outDataSize = sizeof(AudioUnitParameterInfo);
                 if (outWritable) *outWritable = false;
                 return noErr;
@@ -371,12 +418,13 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
-            if (outDataSize && *outDataSize >= sizeof(AudioUnitParameterID)) {
+            if (outDataSize && *outDataSize >= sizeof(AudioUnitParameterID) * 2) {
                 ((AudioUnitParameterID*)outData)[0] = 0;
+                ((AudioUnitParameterID*)outData)[1] = 1;
             }
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
-            // Only support Global scope, element 0
+            // Only support Global scope, element 0 or 1
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
@@ -389,6 +437,18 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
                 info->minValue = 0.0f;
                 info->maxValue = 1.0f;
                 info->defaultValue = 0.5f;
+                info->flags = kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_HasCFNameString;
+                return noErr;
+            }
+            if (elem == 1) {
+                AudioUnitParameterInfo *info = (AudioUnitParameterInfo *)outData;
+                memset(info, 0, sizeof(AudioUnitParameterInfo));
+                strcpy(info->name, "Reload");
+                info->cfNameString = CFSTR("Reload");
+                info->unit = kAudioUnitParameterUnit_Boolean;
+                info->minValue = 0.0f;
+                info->maxValue = 1.0f;
+                info->defaultValue = 0.0f;
                 info->flags = kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_HasCFNameString;
                 return noErr;
             }
