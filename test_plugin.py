@@ -122,6 +122,19 @@ def main():
     else:
         print("✓ Dylib installed")
     
+    # Re-sign the plugin to avoid code signature issues
+    print("\n🔏 Re-signing plugin...")
+    result = subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-",
+         os.path.expanduser("~/Library/Audio/Plug-Ins/Components/MyZigPlugin.component")],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        print(f"Signing failed: {result.stderr}")
+    else:
+        print("✓ Plugin re-signed")
+    
     # Trigger reload via the reload parameter
     print("\n🔄 Triggering hot reload...")
     if hasattr(plugin, 'reload'):
@@ -148,6 +161,11 @@ def main():
         ["cp", "-r", "zig-out/MyZigPlugin.component",
          os.path.expanduser("~/Library/Audio/Plug-Ins/Components/")],
         cwd="/Users/grav/repo/zig-au-plugin",
+        capture_output=True, text=True
+    )
+    subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-",
+         os.path.expanduser("~/Library/Audio/Plug-Ins/Components/MyZigPlugin.component")],
         capture_output=True, text=True
     )
     print("✓ Original version restored and installed")

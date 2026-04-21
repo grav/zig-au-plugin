@@ -1,15 +1,18 @@
 # Zig AU Plugin
 
-A minimal Audio Unit (AU) plugin written in Zig, demonstrating how to create a working AU v2 effect plugin with parameter support.
+A minimal Audio Unit (AU) plugin written in Zig, demonstrating how to create a working AU v2 effect plugin with hot-reload support.
 
 ## Features
 
 - ✅ AU v2 compliant audio effect plugin
-- ✅ Single volume parameter (linear gain, 0.0 - 1.0)
+- ✅ Hot-reload DSP code without restarting your DAW
+- ✅ Custom Cocoa UI with "Reload Zig DSP" button
+- ✅ Volume parameter (linear gain, 0.0 - 1.0)
+- ✅ Reload parameter for triggering hot-reload
 - ✅ Stereo (2-channel) audio processing
 - ✅ Passes full `auval` validation
-- ✅ Render notify callback support
-- ✅ Parameter scheduling support
+- ✅ Configurable debug logging (build-time)
+- ✅ Production-ready build scripts
 
 ## Requirements
 
@@ -17,43 +20,91 @@ A minimal Audio Unit (AU) plugin written in Zig, demonstrating how to create a w
 - Zig compiler (0.16.0 or compatible)
 - Xcode Command Line Tools (for AudioToolbox framework)
 
+## Quick Start
+
+### Build for Production
+
+```bash
+./build_prod.sh
+```
+
+Builds an optimized plugin with debug logging disabled.
+
+### Build for Development
+
+```bash
+./build_dev.sh
+```
+
+Builds with debug logging enabled for development.
+
 ## Project Structure
 
 ```
 .
 ├── build.zig              # Build configuration
+├── build_prod.sh          # Production build script
+├── build_dev.sh           # Development build script
 ├── src/
 │   ├── main.zig          # Audio processing logic (Zig)
-│   ├── wrapper.c         # AU plugin implementation (C)
-│   └── c.h               # C headers
-└── README.md
+│   └── wrapper.m         # AU plugin implementation (Objective-C)
+├── test_plugin.py         # Hot-reload test
+├── test_simple.py         # Simple plugin test
+└── test_build_modes.sh    # Build configuration tests
 ```
 
-## Building
+## Hot-Reload Development
 
-Set your Zig compiler path and build the plugin:
+This plugin supports hot-reloading the DSP code without restarting your DAW!
+
+### How It Works
+
+1. **Edit** `src/main.zig` with your DSP changes
+2. **Rebuild** with `zig build` (or `./build_dev.sh`)
+3. **Trigger reload** via the plugin's `reload` parameter
+
+The plugin dynamically reloads the DSP library using `dlopen()`.
+
+### Testing Hot-Reload
 
 ```bash
-~/bin/zig-aarch64-macos-0.16.0/zig build
+# Run the automated hot-reload test
+uv run test_plugin.py
 ```
 
-The build output will be in `zig-out/MyZigPlugin.component/`
+This will:
+- Load the plugin
+- Modify the DSP code
+- Rebuild and reload
+- Process audio with the new code
+- Restore the original code
 
-## Installation
+### Manual Hot-Reload
 
-Copy the built plugin to your system's Audio Unit plugin directory:
+From Python (using pedalboard):
+```python
+plugin.reload = True  # Triggers DSP reload
+```
+
+Or click the "Reload Zig DSP" button in a DAW that shows plugin UIs.
+
+## Debug Logging
+
+Debug logging is controlled at build time:
 
 ```bash
-cp -r zig-out/MyZigPlugin.component ~/Library/Audio/Plug-Ins/Components
+# Production: No logging (default for release builds)
+zig build -Doptimize=ReleaseFast
+
+# Development: With logging (default for debug builds)
+zig build
+
+# Explicit control
+zig build -Ddebug-logging=true   # Force enable
+zig build -Ddebug-logging=false  # Force disable
 ```
 
-Clear the Audio Unit cache to register the plugin:
-
-```bash
-killall -9 AudioComponentRegistrar
-```
-
-## Testing
+See [DEBUG_LOGGING.md](DEBUG_LOGGING.md) for details.
 
 ### Validate with auval
 

@@ -4,8 +4,6 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
-
-#ifdef __OBJC__
 #import <Cocoa/Cocoa.h>
 #import <AudioUnit/AUCocoaUIView.h>
 
@@ -29,12 +27,16 @@ static void reloadDSP(void);
 }
 
 - (void)reloadClicked:(id)sender {
-    fprintf(stderr, "Reload button clicked!\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "🔘 RELOAD BUTTON CLICKED!\n");
+    fprintf(stderr, "========================================\n");
     reloadDSP();
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "\n");
 }
 
 @end
-#endif
 
 typedef void (*ProcessAudioFunc)(const float*, float*, size_t, float);
 
@@ -359,6 +361,11 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
                 return noErr;
             }
             return kAudioUnitErr_InvalidParameter;
+        case kAudioUnitProperty_CocoaUI:
+            fprintf(stderr, "CocoaUI PropertyInfo requested\n");
+            if (outDataSize) *outDataSize = sizeof(AudioUnitCocoaViewInfo);
+            if (outWritable) *outWritable = false;
+            return noErr;
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -453,6 +460,31 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
                 return noErr;
             }
             return kAudioUnitErr_InvalidParameter;
+        case kAudioUnitProperty_CocoaUI: {
+            if (*outDataSize < sizeof(AudioUnitCocoaViewInfo)) {
+                return kAudioUnitErr_InvalidPropertyValue;
+            }
+            AudioUnitCocoaViewInfo *info = (AudioUnitCocoaViewInfo *)outData;
+            
+            // Create a bundle reference for our plugin bundle
+            CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR("com.example.zigplugin"));
+            if (!bundle) {
+                fprintf(stderr, "CocoaUI: Failed to get bundle\n");
+                return kAudioUnitErr_InvalidPropertyValue;
+            }
+            
+            CFURLRef bundleURL = CFBundleCopyBundleURL(bundle);
+            if (!bundleURL) {
+                fprintf(stderr, "CocoaUI: Failed to get bundle URL\n");
+                return kAudioUnitErr_InvalidPropertyValue;
+            }
+            
+            info->mCocoaAUViewBundleLocation = bundleURL;
+            info->mCocoaAUViewClass[0] = CFStringCreateCopy(NULL, CFSTR("MyPluginUI"));
+            *outDataSize = sizeof(AudioUnitCocoaViewInfo);
+            fprintf(stderr, "CocoaUI property requested - returning MyPluginUI with bundle URL\n");
+            return noErr;
+        }
     }
     return kAudioUnitErr_InvalidProperty;
 }

@@ -4,12 +4,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Add a build option to enable/disable debug logging
+    const enable_debug_logging = b.option(bool, "debug-logging", "Enable debug logging in DSP code") orelse (optimize == .Debug);
+
     // 1. Build the Zig DSP logic as a separate dynamic library (libdsp.dylib)
     const dsp_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    // Add build options to the DSP module
+    const options = b.addOptions();
+    options.addOption(bool, "enable_debug_logging", enable_debug_logging);
+    dsp_module.addImport("build_options", options.createModule());
+
     const dsp_lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "dsp",
@@ -28,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wrapper_module.addCSourceFile(.{
-        .file = b.path("src/wrapper.c"),
+        .file = b.path("src/wrapper.m"),
         .flags = &.{"-fblocks"},
     });
     wrapper_module.linkSystemLibrary("c", .{});
