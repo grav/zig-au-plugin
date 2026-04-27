@@ -2,8 +2,103 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
+#include <stdatomic.h>
+#import <Cocoa/Cocoa.h>
+#import <AudioUnit/AUCocoaUIView.h>
 
-extern void processAudio(const float* in_buffer, float* out_buffer, size_t frames, float volume);
+static void reloadDSP(void);
+
+@interface MyPluginUI : NSObject <AUCocoaUIBase>
+@end
+
+@implementation MyPluginUI
+
+- (unsigned)interfaceVersion {
+    return 0;
+}
+
+- (NSView *)uiViewForAudioUnit:(AudioUnit)inAudioUnit withSize:(NSSize)inPreferredSize {
+    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 100)];
+    NSButton *button = [NSButton buttonWithTitle:@"Reload Zig DSP" target:self action:@selector(reloadClicked:)];
+    button.frame = NSMakeRect(50, 30, 200, 40);
+    [view addSubview:button];
+    return view;
+}
+
+- (void)reloadClicked:(id)sender {
+    fprintf(stderr, "\n");
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "🔘 RELOAD BUTTON CLICKED!\n");
+    fprintf(stderr, "========================================\n");
+    reloadDSP();
+    fprintf(stderr, "========================================\n");
+    fprintf(stderr, "\n");
+}
+
+@end
+
+typedef void (*ProcessAudioFunc)(const float*, float*, size_t, float);
+
+static void defaultProcessAudio(const float* in_buffer, float* out_buffer, size_t frames, float volume) {
+    for (size_t i = 0; i < frames; i++) {
+        out_buffer[i] = in_buffer[i] * volume;
+    }
+}
+
+static _Atomic ProcessAudioFunc g_processAudio = defaultProcessAudio;
+static void* g_dspHandle = NULL;
+
+static void reloadDSP(void) {
+    char dylibPath[1024];
+    
+    // Use dladdr to find where our own code is loaded from
+    Dl_info info;
+    if (dladdr((void*)reloadDSP, &info) == 0 || info.dli_fname == NULL) {
+        fprintf(stderr, "reloadDSP: ⚠️ Failed to determine plugin location\n");
+        return;
+    }
+    
+    // The dli_fname will be something like:
+    // /Users/.../MyZigPlugin.component/Contents/MacOS/libMyZigPlugin.dylib
+    // We need to change libMyZigPlugin.dylib to libdsp.dylib
+    
+    char* lastSlash = strrchr(info.dli_fname, '/');
+    if (lastSlash == NULL) {
+        fprintf(stderr, "reloadDSP: ⚠️ Invalid plugin path\n");
+        return;
+    }
+    
+    size_t dirLen = lastSlash - info.dli_fname + 1;
+    if (dirLen >= sizeof(dylibPath) - 20) {
+        fprintf(stderr, "reloadDSP: ⚠️ Path too long\n");
+        return;
+    }
+    
+    strncpy(dylibPath, info.dli_fname, dirLen);
+    dylibPath[dirLen] = '\0';
+    strcat(dylibPath, "libdsp.dylib");
+    
+    fprintf(stderr, "reloadDSP: Loading from bundle: %s\n", dylibPath);
+    
+    void* handle = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL);
+    if (handle) {
+        ProcessAudioFunc newFunc = (ProcessAudioFunc)dlsym(handle, "processAudio");
+        if (newFunc) {
+            fprintf(stderr, "reloadDSP: ✓ Loaded successfully\n");
+            atomic_store(&g_processAudio, newFunc);
+            g_dspHandle = handle;
+            return;
+        } else {
+            fprintf(stderr, "reloadDSP: ✗ Failed to find processAudio symbol: %s\n", dlerror());
+        }
+        dlclose(handle);
+    } else {
+        fprintf(stderr, "reloadDSP: ✗ Failed to load dylib: %s\n", dlerror());
+    }
+    
+    fprintf(stderr, "reloadDSP: ⚠️ Using default C implementation\n");
+}
 
 #define MAX_RENDER_NOTIFY_CALLBACKS 8
 
@@ -11,8 +106,10 @@ typedef struct {
     AudioComponentPlugInInterface pluginInterface;
     AudioComponentInstance instance;
     float volume;
+    float reloadTrigger;
     AudioStreamBasicDescription streamFormat;
     AURenderCallbackStruct renderCallback;
+    AURenderCallbackStruct notifyCallback;
     AudioUnitConnection connection;
     UInt32 maxFrames;
     AUPreset currentPreset;
@@ -99,6 +196,7 @@ static OSStatus AUScheduleParameters(void *self, const AudioUnitParameterEvent *
 }
 
 static AudioComponentMethod AULookup(SInt16 selector) {
+    fprintf(stderr, "LOOKUP: %d\n", selector);
     switch (selector) {
         case kAudioUnitInitializeSelect: return (AudioComponentMethod)AUInitialize;
         case kAudioUnitUninitializeSelect: return (AudioComponentMethod)AUUninitialize;
@@ -141,6 +239,7 @@ void* MyZigPluginFactory(const AudioComponentDescription *inDesc) {
     
     state->maxFrames = 512;
     state->volume = 0.5f;
+    state->reloadTrigger = 0.0f;
     state->currentPreset.presetNumber = 0;
     state->currentPreset.presetName = CFSTR("Default");
 
@@ -157,7 +256,11 @@ static OSStatus AUClose(void *self) {
     return noErr;
 }
 
-static OSStatus AUInitialize(void *self) { return noErr; }
+static OSStatus AUInitialize(void *self) {
+    printf("AUInitialize called\n");
+    reloadDSP();
+    return noErr;
+}
 static OSStatus AUUninitialize(void *self) { return noErr; }
 static OSStatus AUReset(void *self, AudioUnitScope scope, AudioUnitElement elem) { return noErr; }
 
@@ -176,6 +279,10 @@ static OSStatus AUGetParameter(void *self, AudioUnitParameterID param, AudioUnit
         *value = state->volume;
         return noErr;
     }
+    if (param == 1) {
+        *value = state->reloadTrigger;
+        return noErr;
+    }
     return kAudioUnitErr_InvalidParameter;
 }
 
@@ -192,6 +299,14 @@ static OSStatus AUSetParameter(void *self, AudioUnitParameterID param, AudioUnit
     
     if (param == 0) {
         state->volume = value;
+        return noErr;
+    }
+    if (param == 1) {
+        if (value >= 0.5f) {  // Trigger reload when set to 1.0 (or >= 0.5)
+            fprintf(stderr, "🔄 Reload triggered via parameter!\n");
+            reloadDSP();
+        }
+        state->reloadTrigger = value;
         return noErr;
     }
     return kAudioUnitErr_InvalidParameter;
@@ -232,7 +347,7 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
-            if (outDataSize) *outDataSize = sizeof(AudioUnitParameterID) * 1;
+            if (outDataSize) *outDataSize = sizeof(AudioUnitParameterID) * 2;  // 2 parameters
             if (outWritable) *outWritable = false;
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
@@ -240,12 +355,17 @@ static OSStatus AUGetPropertyInfo(void *self, AudioUnitPropertyID prop, AudioUni
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
-            if (elem == 0) {
+            if (elem == 0 || elem == 1) {
                 if (outDataSize) *outDataSize = sizeof(AudioUnitParameterInfo);
                 if (outWritable) *outWritable = false;
                 return noErr;
             }
             return kAudioUnitErr_InvalidParameter;
+        case kAudioUnitProperty_CocoaUI:
+            fprintf(stderr, "CocoaUI PropertyInfo requested\n");
+            if (outDataSize) *outDataSize = sizeof(AudioUnitCocoaViewInfo);
+            if (outWritable) *outWritable = false;
+            return noErr;
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -305,12 +425,13 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
-            if (outDataSize && *outDataSize >= sizeof(AudioUnitParameterID)) {
+            if (outDataSize && *outDataSize >= sizeof(AudioUnitParameterID) * 2) {
                 ((AudioUnitParameterID*)outData)[0] = 0;
+                ((AudioUnitParameterID*)outData)[1] = 1;
             }
             return noErr;
         case kAudioUnitProperty_ParameterInfo:
-            // Only support Global scope, element 0
+            // Only support Global scope, element 0 or 1
             if (scope != kAudioUnitScope_Global) {
                 return kAudioUnitErr_InvalidScope;
             }
@@ -326,7 +447,44 @@ static OSStatus AUGetProperty(void *self, AudioUnitPropertyID prop, AudioUnitSco
                 info->flags = kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_HasCFNameString;
                 return noErr;
             }
+            if (elem == 1) {
+                AudioUnitParameterInfo *info = (AudioUnitParameterInfo *)outData;
+                memset(info, 0, sizeof(AudioUnitParameterInfo));
+                strcpy(info->name, "Reload");
+                info->cfNameString = CFSTR("Reload");
+                info->unit = kAudioUnitParameterUnit_Boolean;
+                info->minValue = 0.0f;
+                info->maxValue = 1.0f;
+                info->defaultValue = 0.0f;
+                info->flags = kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_HasCFNameString;
+                return noErr;
+            }
             return kAudioUnitErr_InvalidParameter;
+        case kAudioUnitProperty_CocoaUI: {
+            if (*outDataSize < sizeof(AudioUnitCocoaViewInfo)) {
+                return kAudioUnitErr_InvalidPropertyValue;
+            }
+            AudioUnitCocoaViewInfo *info = (AudioUnitCocoaViewInfo *)outData;
+            
+            // Create a bundle reference for our plugin bundle
+            CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR("com.example.zigplugin"));
+            if (!bundle) {
+                fprintf(stderr, "CocoaUI: Failed to get bundle\n");
+                return kAudioUnitErr_InvalidPropertyValue;
+            }
+            
+            CFURLRef bundleURL = CFBundleCopyBundleURL(bundle);
+            if (!bundleURL) {
+                fprintf(stderr, "CocoaUI: Failed to get bundle URL\n");
+                return kAudioUnitErr_InvalidPropertyValue;
+            }
+            
+            info->mCocoaAUViewBundleLocation = bundleURL;
+            info->mCocoaAUViewClass[0] = CFStringCreateCopy(NULL, CFSTR("MyPluginUI"));
+            *outDataSize = sizeof(AudioUnitCocoaViewInfo);
+            fprintf(stderr, "CocoaUI property requested - returning MyPluginUI with bundle URL\n");
+            return noErr;
+        }
     }
     return kAudioUnitErr_InvalidProperty;
 }
@@ -393,7 +551,7 @@ static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, 
             ioData->mBuffers[i].mData = dummyBuffer[i];
         }
     }
-
+    
     if (state->connection.sourceAudioUnit) {
         OSStatus err = AudioUnitRender(state->connection.sourceAudioUnit, ioActionFlags, inTimeStamp, state->connection.sourceOutputNumber, inNumberFrames, ioData);
         if (err != noErr) return err;
@@ -406,7 +564,8 @@ static OSStatus AURender(void *self, AudioUnitRenderActionFlags *ioActionFlags, 
     for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
         float *buffer = (float *)ioData->mBuffers[i].mData;
         if (buffer) {
-            processAudio(buffer, buffer, inNumberFrames, state->volume);
+            ProcessAudioFunc func = atomic_load(&g_processAudio);
+            func(buffer, buffer, inNumberFrames, state->volume);
         }
     }
 
